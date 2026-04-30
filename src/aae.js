@@ -32,6 +32,17 @@ export const SIGNED_FIELDS = Object.freeze([
 // (audit log, matchAcl callback, rate-limit key, error responses) from
 // log-injection / DB-bloat / memory-pressure via outsized signer fields.
 const MAX_STRING_FIELD_LEN = 256;
+// Tighter cap for the signature itself. Ed25519 signatures are 64
+// raw bytes ≈ 86 base64url chars; we leave generous headroom for
+// future signature schemes that fit in the X-AAE header. A multi-MB
+// `sig` would otherwise allocate proportionally large buffers in
+// b64urlDecode before signature verification fails.
+const MAX_SIG_LEN = 512;
+// Bound on perm array length. Each element gets canonicalized into
+// the signed payload + visited per coversOp() call. Real-world envelopes
+// carry a handful of entries; a 100k-entry perm is amplification, not
+// legitimate use.
+const MAX_PERM_LEN = 100;
 
 function isFiniteNumber(v) {
   return typeof v === 'number' && Number.isFinite(v);
@@ -90,7 +101,14 @@ function ok(env) {
 }
 
 function coversOp(perms, op, wing, room) {
+  if (!Array.isArray(perms)) return false;
   for (const p of perms) {
+    // Defensive: perm is array-validated at verify time, but elements
+    // aren't deep-checked. A null or non-object element here would
+    // throw on `p.op` access and crash the request handler that
+    // called coversOp(). Skip rather than throw so callers can rely
+    // on this returning a clean boolean.
+    if (!p || typeof p !== 'object') continue;
     if (p.op !== op) continue;
     if (p.wing !== '*' && p.wing !== wing) continue;
     if (p.room && p.room !== '*' && p.room !== room) continue;
@@ -167,6 +185,7 @@ export async function verifyAae(headerVal, ctx) {
   if (env.iat != null && !isFiniteNumber(env.iat)) return fail('iat_invalid_type', { issuer: env.iss, jti: env.jti });
   if (env.hop != null && !isFiniteNumber(env.hop)) return fail('hop_invalid_type', { issuer: env.iss, jti: env.jti });
   if (env.perm != null && !Array.isArray(env.perm)) return fail('perm_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (Array.isArray(env.perm) && env.perm.length > MAX_PERM_LEN) return fail('perm_too_long', { issuer: env.iss, jti: env.jti });
 
   // String-field length caps. Outsized signer values flow into
   // audit logs, ACL lookups, rate-limit keys, response bodies — bound
@@ -241,7 +260,16 @@ export async function verifyAae(headerVal, ctx) {
     return fail('replay', { issuer: env.iss, jti: env.jti });
   }
 
-  if (await ctx.revocationChecker.isRevoked(env.jti)) {
+  // Wrap revocation check separately from key resolve so an operator
+  // can distinguish a revocation-backend outage from a key-resolver
+  // outage in their logs (both fail-close, but the cause differs).
+  let revoked;
+  try {
+    revoked = await ctx.revocationChecker.isRevoked(env.jti);
+  } catch {
+    return fail('revocation_checker_failed', { issuer: env.iss, jti: env.jti });
+  }
+  if (revoked) {
     return fail('revoked', { issuer: env.iss, jti: env.jti });
   }
 
@@ -271,6 +299,9 @@ export async function verifyAae(headerVal, ctx) {
   const payload = signablePayload(env);
   const sig = env.sig;
   if (typeof sig !== 'string') return fail('sig_missing', { issuer: env.iss, jti: env.jti });
+  // Length cap before decoding — defends against multi-MB sig
+  // strings allocating large Buffers for a guaranteed verify failure.
+  if (sig.length > MAX_SIG_LEN) return fail('sig_too_long', { issuer: env.iss, jti: env.jti });
   let sigBuf;
   try { sigBuf = b64urlDecode(sig); } catch { return fail('sig_decode_error', { issuer: env.iss, jti: env.jti }); }
 

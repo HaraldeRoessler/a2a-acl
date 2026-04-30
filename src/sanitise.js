@@ -101,6 +101,20 @@ export function sanitiseDeep(v) {
       // unicode could survive into downstream prompts depending on
       // how the receiver renders the request. Cheap to defend.
       const { value: sanitisedKey, hits: kh } = sanitiseString(k);
+      // Skip prototype-pollution-flavoured keys. JSON.parse on modern
+      // Node treats __proto__ as a regular own property, but if
+      // upstream code (some non-Express body parser, or hand-rolled
+      // input) sets __proto__ enumerably AND we then write
+      // out['__proto__'] = ..., we mutate the prototype of `out`
+      // rather than creating a data property. Belt-and-braces.
+      if (
+        sanitisedKey === '__proto__' ||
+        sanitisedKey === 'constructor' ||
+        sanitisedKey === 'prototype'
+      ) {
+        hits += kh; // record that we saw + dropped it
+        continue;
+      }
       const { value: sanitisedVal, hits: vh } = sanitiseDeep(vv);
       out[sanitisedKey] = sanitisedVal;
       hits += kh + vh;

@@ -50,9 +50,14 @@ function isPublic(req, basePath = '/api/a2a') {
   const fullPath = (req.baseUrl || '') + (req.path || '');
   if (PUBLIC_PATHS.has(fullPath)) return true;
   if (PUBLIC_PATHS.has(req.path)) return true;
-  // Allow shorthand match against the configured basePath too.
-  if (basePath && (req.path === `${basePath}/agent-card` || fullPath === `${basePath}/agent-card`)) return true;
-  if (req.path === '/agent-card' || fullPath.endsWith('/agent-card')) return true;
+  // Exact match against the configured basePath's agent-card.
+  if (basePath && fullPath === `${basePath}/agent-card`) return true;
+  if (basePath && req.path === `${basePath}/agent-card`) return true;
+  // When the chain is mounted at basePath, req.path === '/agent-card'
+  // and req.baseUrl === basePath. Match only this specific shape;
+  // do NOT use endsWith('/agent-card') — that would let any URL
+  // ending in /agent-card pass auth (e.g. /internal/api/a2a/agent-card).
+  if (req.path === '/agent-card' && (req.baseUrl || '') === basePath) return true;
   return false;
 }
 
@@ -91,6 +96,22 @@ export function verifyAaeMiddleware({
     }
 
     const headerVal = req.headers['x-klaw-aae'] || req.headers['x-aae'];
+
+    // Resolve expectedSub synchronously. If the caller's getExpectedSub
+    // returns a Promise (an accidentally-async function), passing the
+    // Promise to verifyAaeImpl would cause `env.sub !== expectedSub`
+    // to compare a string to a Promise — every request would 401 with
+    // 'wrong_subject'. Catch this footgun explicitly with a clear
+    // operator-side error so the misconfiguration is loud.
+    let expectedSubValue;
+    if (typeof getExpectedSub === 'function') {
+      expectedSubValue = getExpectedSub(req);
+      if (expectedSubValue && typeof expectedSubValue.then === 'function') {
+        logger?.error?.({}, 'getExpectedSub must be synchronous');
+        return res.status(500).json({ error: 'middleware_misconfigured' });
+      }
+    }
+
     let result;
     try {
       result = await verifyAaeImpl(headerVal, {
@@ -98,7 +119,7 @@ export function verifyAaeMiddleware({
         revocationChecker,
         nonceCache,
         expectedAud: expectedAud === null ? null : (expectedAud ?? 'a2a-ingress'),
-        expectedSub: typeof getExpectedSub === 'function' ? getExpectedSub(req) : undefined,
+        expectedSub: expectedSubValue,
       });
     } catch (err) {
       // Log details server-side; never include err.message in the
@@ -115,13 +136,15 @@ export function verifyAaeMiddleware({
         issuer: result.issuer,
         slug: getSlug(req),
       }, 'aae rejected');
-      // Resolver failure → 503 so callers retry. The verify side
-      // returns the reason as exactly 'key_resolver_failed' (no
-      // colon-suffixed details). Match exactly to avoid the bug
-      // from 0.1.2 where startsWith('key_resolver_failed:') was
-      // never true and the 503 path was unreachable.
-      if (result.reason === 'key_resolver_failed') {
-        return res.status(503).json({ error: 'key_resolver_unavailable' });
+      // Backend-failure reasons → 503 so callers retry. Key resolver
+      // and revocation checker are both fail-closed dependencies; if
+      // either is unavailable we can't decide on the envelope.
+      // 0.1.2 had a bug here where the check was startsWith with a
+      // trailing colon that never matched — fixed in 0.1.3 with
+      // exact match. revocation_checker_failed added in 0.1.4 to
+      // distinguish in operator logs.
+      if (result.reason === 'key_resolver_failed' || result.reason === 'revocation_checker_failed') {
+        return res.status(503).json({ error: 'verify_unavailable' });
       }
       return res.status(401).json({ error: 'aae_rejected', reason: result.reason });
     }
@@ -192,6 +215,13 @@ export function aclCheckMiddleware({ matchAcl, getSlug = defaultGetSlug, getCapa
  */
 export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7, logger = null }) {
   if (!trustResolver) throw new Error('trustScoreGateMiddleware requires trustResolver');
+  // Defence against silent misconfiguration. NaN passes typeof===
+  // 'number' but means `score < threshold` is always false → every
+  // request would silently bypass the gate. Catch this at construct
+  // time so a typo in config fails loudly rather than at runtime.
+  if (!Number.isFinite(defaultThreshold) || defaultThreshold < 0 || defaultThreshold > 1) {
+    throw new Error('defaultThreshold must be a finite number between 0 and 1');
+  }
 
   return async function trustScoreGate(req, res, next) {
     const fw = ensureFirewall(req);

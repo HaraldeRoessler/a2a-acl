@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.1.4 — 2026-04-30
+
+Fourth-pass review. Two reviewers, eight more findings, all
+addressed. Most are defence-in-depth on top of the already-strong
+0.1.3 surface.
+
+### Fixed
+
+- **`sig` field length cap (LOW-MED)** (`aae.js`). All other string
+  fields were 256-char-capped; `sig` was unchecked. An attacker with
+  a valid signing key could ship a 10MB base64 sig, decoded to ~7.5MB
+  in `b64urlDecode` before signature verification fails. Now: capped
+  at 512 chars (Ed25519 sig is ~86 chars; future post-quantum schemes
+  fit under the cap or warrant a major bump).
+
+- **`perm` array element count cap (LOW)** (`aae.js`). Array type
+  was checked but length wasn't. A signer with a valid key could
+  send `perm: new Array(100_000).fill({...})` which gets canonicalised
+  into the signed payload + visited per `coversOp()`. Now: 100-element
+  cap with explicit `perm_too_long` reason.
+
+- **`coversOp` defensive against null/non-object perm elements
+  (MEDIUM)** (`aae.js`). Previous: `p.op` accesses on a null element
+  would throw, crashing the request handler. Now: skips non-object
+  entries silently. Caller can rely on `coversOp` returning a clean
+  boolean.
+
+- **`isPublic` overly broad suffix match (LOW)** (`middleware.js`).
+  0.1.3 added `endsWith('/agent-card')` as a fallback for the
+  mounted-middleware case. That accidentally matched any URL ending
+  in `/agent-card` — e.g. `/internal/something/agent-card` would
+  bypass auth. Now: exact match only against canonical paths,
+  including the configured basePath's `/agent-card`. The mounted
+  case is recognised by `req.path === '/agent-card' && req.baseUrl
+  === basePath`.
+
+- **`sanitiseDeep` skips `__proto__` / `constructor` / `prototype`
+  keys (VERY LOW)** (`sanitise.js`). Sanitiser was already covering
+  values + keys, but `out['__proto__'] = ...` would mutate the
+  output's prototype rather than create a data property if upstream
+  code passed `__proto__` as an own enumerable. Now: the three
+  prototype-pollution-flavoured keys are dropped entirely.
+
+- **`revocationChecker.isRevoked()` throw mapped to distinct reason
+  (VERY LOW, observability)** (`aae.js`, `middleware.js`). Previously
+  rev-backend errors propagated up as a generic 'aae verify threw'.
+  Now: caught at the verify layer and surfaced as
+  `revocation_checker_failed`, distinct from `key_resolver_failed`.
+  Both still 503 client-side (under the unified `verify_unavailable`
+  label), but operators can distinguish in their logs.
+
+- **`CircuitBreaker` numeric param validation (INFO)**
+  (`rate-limit.js`). Previously accepted `threshold: NaN` /
+  `cooldownMs: Infinity` silently — the breaker would never open
+  or never close. Now throws at construct time so a typo in config
+  fails loudly.
+
+- **`trustScoreGateMiddleware` `defaultThreshold` validation
+  (INFO)** (`middleware.js`). Same pattern. Previously a NaN
+  threshold meant `score < threshold` was always false → every
+  request bypassed the gate silently. Now throws at construct time.
+
+- **`getExpectedSub` Promise detection (INFO, dev footgun)**
+  (`middleware.js`). If the caller accidentally made the callback
+  async, the returned Promise was passed as `expectedSub`, then
+  `string !== Promise` rejected every request as `wrong_subject`.
+  Now: detected explicitly and surfaced as
+  `{"error":"middleware_misconfigured"}` (HTTP 500) with a clear
+  error log, so the misconfiguration is loud.
+
+### Added
+
+- 16 new regression tests in `test/security-4.test.js` covering
+  every fix above.
+- 90/90 tests pass (74 from 0.1.3 + 16 new).
+
+### Behavioural change worth noting
+
+- `verifyAaeMiddleware` now returns
+  `{"error":"verify_unavailable"}` for both
+  `key_resolver_failed` and `revocation_checker_failed` (was
+  `{"error":"key_resolver_unavailable"}` for the former in 0.1.3).
+  The reason was unified under one label — clients don't need to
+  know which backend failed, and the operator-side logs distinguish
+  the two via the `result.reason` field.
+
 ## 0.1.3 — 2026-04-30
 
 Third-pass security review. Two external reviewers (independently)

@@ -185,6 +185,18 @@ const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
 
 export class CircuitBreaker {
   constructor({ threshold = DEFAULT_THRESHOLD, cooldownMs = DEFAULT_COOLDOWN_MS, maxPeers = 10_000 } = {}) {
+    // Defence against silent misconfiguration. NaN/Infinity for any
+    // of these would result in the breaker either never opening or
+    // never closing — a typo at construct time should fail loudly.
+    if (!Number.isFinite(threshold) || threshold < 1) {
+      throw new Error('threshold must be a finite positive number');
+    }
+    if (!Number.isFinite(cooldownMs) || cooldownMs < 0) {
+      throw new Error('cooldownMs must be a finite non-negative number');
+    }
+    if (!Number.isFinite(maxPeers) || maxPeers <= 0) {
+      throw new Error('maxPeers must be a positive number');
+    }
     this.threshold = threshold;
     this.cooldownMs = cooldownMs;
     this.maxPeers = maxPeers;

@@ -198,7 +198,9 @@ test('verifyAaeMiddleware returns 503 on resolver throw (was 401 in 0.1.2)', asy
   server.close();
   assert.equal(r.status, 503, 'resolver throw must yield 503 (transient), not 401');
   const body = await r.json();
-  assert.equal(body.error, 'key_resolver_unavailable');
+  // 0.1.4 unified the backend-failure response label to
+  // 'verify_unavailable' (was 'key_resolver_unavailable' in 0.1.3).
+  assert.equal(body.error, 'verify_unavailable');
 });
 
 /* ─── Public-path-under-mount ─── */
