@@ -1,0 +1,52 @@
+{
+  "name": "a2a-acl",
+  "version": "0.1.0",
+  "description": "Per-tool capability ACL + AAE envelope verification for agent-to-agent communication. Hard-deny structured capabilities at the gateway; soft-mediate conversation at the prompt layer.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "example": "node examples/express-server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "a2a",
+    "agent-to-agent",
+    "acl",
+    "agent-web",
+    "capability",
+    "aae",
+    "ed25519",
+    "express-middleware",
+    "moltrust",
+    "ownify"
+  ],
+  "author": "Harald Roessler",
+  "license": "MIT",
+  "homepage": "https://github.com/HaraldeRoessler/a2a-acl",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaraldeRoessler/a2a-acl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HaraldeRoessler/a2a-acl/issues"
+  },
+  "peerDependencies": {
+    "express": "^4 || ^5"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  }
+}
