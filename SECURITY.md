@@ -144,6 +144,42 @@ In `verifyAae`:
 - `maxLifetimeSec` defaults to 300 (5 minutes) — envelopes claiming
   longer validity are rejected
 - `iatSkewSec` defaults to 60 — clock skew tolerance window
+- Canonicalisation uses a strict allowlist of envelope fields. Extra
+  keys (including `__proto__`) on the parsed envelope are not signed
+  over and not trusted.
+
+In rate-limit / token-budget / resolvers:
+
+- `RateLimiter.maxBuckets` defaults to 100,000
+- `DailyTokenBudget.maxBuckets` defaults to 100,000
+- `TtlResolver.maxSize` defaults to 10,000
+- `RevocationChecker.maxSize` defaults to 10,000
+
+These caps bound memory under attacker-controlled key floods.
+Sizing guidance: pick a bound that comfortably exceeds your
+expected legitimate-traffic distinct-key population over the cache
+TTL window. If you see eviction churn in production, raise the cap
+or shorten envelope `exp`. Eviction is FIFO over insertion order
+(after sweeping expired entries); a real user whose entry is
+evicted under flood gets a fresh window — degraded enforcement,
+not service denial.
+
+In `verifyAaeMiddleware`:
+
+- HTTP 503 response on resolver-throw includes only
+  `{"error":"verify_unavailable"}`. Underlying error message is
+  logged server-side via the `logger` callback only — never leaked
+  to the client.
+- All `verifyAae` fail-reason strings are opaque (no embedded error
+  message slices).
+
+In `auditMiddleware`:
+
+- Query string is **stripped from the audit path** by default
+  (defends against accidental token logging). Set
+  `includeQueryInAudit: true` to opt in.
+- Sink failure is logged at **error** level (was warn) — a silent
+  audit-trail gap is a security incident.
 
 You can relax these for migration compatibility, but the library
 defaults to "fail closed".

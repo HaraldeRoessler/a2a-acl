@@ -20,6 +20,14 @@
 
 export const CAP_PATTERN = /^(message|invoke_tool:[a-z0-9-]{1,40}|read_memory:[a-z][a-z0-9-]{0,30}(\/[a-z][a-z0-9-]{0,30})?)$/;
 
+// Per-segment validators used by inferCapability to refuse outsized
+// or out-of-charset wing/room/tool values BEFORE constructing the
+// capability string. Without this, an attacker could send a 10MB
+// `wing` field which would flow into matchAcl, audit logs, and
+// error responses — DoS + log-injection vector.
+const TOOL_NAME_RE = /^[a-z0-9-]{1,40}$/;
+const SEGMENT_RE = /^[a-z][a-z0-9-]{0,30}$/;
+
 /**
  * Parse a capability string into a structured form.
  * Returns { kind: 'message' } | { kind: 'invoke_tool', name } |
@@ -65,17 +73,22 @@ export function inferCapability(req, opts = {}) {
 
   if (path === '/invoke_tool') {
     const tool = req.body?.tool;
-    if (typeof tool === 'string' && /^[a-z0-9-]{1,40}$/.test(tool)) {
-      return `invoke_tool:${tool}`;
-    }
-    return null;
+    if (typeof tool !== 'string') return null;
+    if (!TOOL_NAME_RE.test(tool)) return null;
+    return `invoke_tool:${tool}`;
   }
 
   if (path === '/read_memory' || path === '/list_drawers' || path === '/search') {
     const wing = req.body?.wing;
     const room = req.body?.room;
-    if (typeof wing !== 'string') return null;
-    if (typeof room === 'string' && room.length > 0) return `read_memory:${wing}/${room}`;
+    // Length + charset validation BEFORE composing the capability
+    // string. Caller's matchAcl / audit / logger never sees outsized
+    // attacker-controlled segments.
+    if (typeof wing !== 'string' || !SEGMENT_RE.test(wing)) return null;
+    if (room !== undefined && room !== null && room !== '') {
+      if (typeof room !== 'string' || !SEGMENT_RE.test(room)) return null;
+      return `read_memory:${wing}/${room}`;
+    }
     return `read_memory:${wing}`;
   }
 

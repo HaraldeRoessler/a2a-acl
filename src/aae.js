@@ -1,12 +1,28 @@
 // AAE — Agent Authorization Envelope verification.
 //
 // Envelope wire format: base64url-encoded JSON. Signature is Ed25519
-// over the canonical-stringified envelope minus the `sig` field.
-// Canonicalisation matches RFC 8785-lite (sort object keys, no
-// whitespace) — issuer must use the same canonicalize() to produce
-// the signed bytes.
+// over the canonical-stringified SIGNED VIEW of the envelope —
+// constructed by enumerating only the allow-listed envelope fields,
+// in the order this library defines. The signer MUST follow the same
+// rule. This eliminates engine/language-specific differences in how
+// extra keys (e.g. `__proto__`) are handled by JSON.parse and
+// `Object.keys`.
+//
+// Canonicalisation: RFC 8785-lite (sort keys, no whitespace, JSON
+// stringify scalars).
 
 import { verify as cryptoVerify, createPublicKey } from 'node:crypto';
+
+// Strict allowlist of envelope fields that participate in the
+// signature. Anything else in the parsed JSON is ignored — never
+// signed over, never trusted. Adding a new field is a breaking change
+// that requires a coordinated bump (env.v + library version).
+const SIGNED_FIELDS = [
+  'v', 'iss', 'sub', 'aud',
+  'exp', 'iat', 'jti',
+  'sig_key_id', 'sig_alg',
+  'hop', 'perm',
+];
 
 function b64urlDecode(s) {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -178,32 +194,42 @@ export async function verifyAae(headerVal, ctx) {
   let keyMaterial;
   try {
     keyMaterial = await ctx.keyResolver.resolve(env.sig_key_id);
-  } catch (err) {
-    // Fail-closed: never accept unverified signatures on the public boundary.
-    return fail(`key_resolver_failed:${err?.message?.slice(0, 30) ?? 'unknown'}`, { issuer: env.iss, jti: env.jti });
+  } catch {
+    // Fail-closed. Underlying error message is the resolver's
+    // responsibility to log — we surface only a fixed reason so we
+    // don't leak internal implementation details to the client.
+    return fail('key_resolver_failed', { issuer: env.iss, jti: env.jti });
   }
   if (!keyMaterial) return fail('unknown_key', { issuer: env.iss, jti: env.jti });
 
   let key;
   try {
     key = pubKeyFromB64Url(keyMaterial.public_key_b64url);
-  } catch (err) {
-    return fail(`key_format_error:${err.message.slice(0, 30)}`, { issuer: env.iss, jti: env.jti });
+  } catch {
+    return fail('key_format_error', { issuer: env.iss, jti: env.jti });
   }
 
-  // Canonicalize everything except `sig`. The signing side must compute
-  // the signature over the same byte sequence — any mismatch (key order,
-  // whitespace, type coercion) fails verification.
-  const { sig, ...signed } = env;
+  // Build the SIGNED VIEW from the allowlist only. Anything else in
+  // the parsed envelope (including __proto__, constructor, future
+  // experimental fields) is not signed over and not trusted.
+  const signed = {};
+  for (const k of SIGNED_FIELDS) {
+    if (Object.hasOwn(env, k)) signed[k] = env[k];
+  }
   const payload = Buffer.from(canonicalize(signed), 'utf8');
+  const sig = env.sig;
+  if (typeof sig !== 'string') return fail('sig_missing', { issuer: env.iss, jti: env.jti });
   let sigBuf;
   try { sigBuf = b64urlDecode(sig); } catch { return fail('sig_decode_error', { issuer: env.iss, jti: env.jti }); }
 
   let good = false;
   try {
     good = cryptoVerify(null, payload, key, sigBuf);
-  } catch (err) {
-    return fail(`sig_verify_error:${err?.message?.slice(0, 30) ?? 'unknown'}`, { issuer: env.iss, jti: env.jti });
+  } catch {
+    // Verification threw (e.g. malformed signature buffer). Don't
+    // surface the underlying error — return a fixed reason and let
+    // the caller's logger record details from server-side context.
+    return fail('sig_verify_error', { issuer: env.iss, jti: env.jti });
   }
   if (!good) return fail('sig_invalid', { issuer: env.iss, jti: env.jti });
 

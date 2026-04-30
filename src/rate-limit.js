@@ -10,15 +10,28 @@
 const SWEEP_INTERVAL_MS = 60_000;
 
 /**
- * Sliding window rate limiter. Keeps a list of request timestamps per
- * key, prunes anything outside the window on each check.
+ * Sliding window rate limiter. Keeps a list of request timestamps
+ * per key.
+ *
+ * Bucket count is bounded by `maxBuckets`. When a new key arrives at
+ * the cap, the OLDEST bucket (insertion order) is evicted. This
+ * prevents unbounded memory growth from attacker-controlled keys
+ * (e.g. a flood of synthetic caller_dids) while letting legitimate
+ * traffic continue. The trade-off: a real user whose bucket is
+ * evicted under flood gets a fresh window — degraded rate-limiting
+ * but not service denial. Set `maxBuckets` based on legitimate
+ * traffic volume; see SECURITY.md for sizing guidance.
  */
 export class RateLimiter {
-  constructor({ requestsPerMinute }) {
+  constructor({ requestsPerMinute, maxBuckets = 100_000 } = {}) {
     if (!Number.isFinite(requestsPerMinute) || requestsPerMinute <= 0) {
       throw new Error('requestsPerMinute must be a positive number');
     }
+    if (!Number.isFinite(maxBuckets) || maxBuckets <= 0) {
+      throw new Error('maxBuckets must be a positive number');
+    }
     this.limit = requestsPerMinute;
+    this.maxBuckets = maxBuckets;
     this.windowMs = 60_000;
     this.buckets = new Map();
     this.sweepInterval = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
@@ -34,6 +47,16 @@ export class RateLimiter {
     const cutoff = now - this.windowMs;
     let bucket = this.buckets.get(key);
     if (!bucket) {
+      // Make room for the new bucket if we're at the cap. Sweep
+      // first; if still full, evict the oldest. Map iteration order
+      // is insertion order so the first key is the oldest.
+      if (this.buckets.size >= this.maxBuckets) {
+        this.sweep();
+        if (this.buckets.size >= this.maxBuckets) {
+          const oldest = this.buckets.keys().next().value;
+          this.buckets.delete(oldest);
+        }
+      }
       bucket = [];
       this.buckets.set(key, bucket);
     }
@@ -67,11 +90,15 @@ export class RateLimiter {
  * runaway peer from burning a tenant's budget in seconds.
  */
 export class DailyTokenBudget {
-  constructor({ tokensPerDay }) {
+  constructor({ tokensPerDay, maxBuckets = 100_000 } = {}) {
     if (!Number.isFinite(tokensPerDay) || tokensPerDay <= 0) {
       throw new Error('tokensPerDay must be a positive number');
     }
+    if (!Number.isFinite(maxBuckets) || maxBuckets <= 0) {
+      throw new Error('maxBuckets must be a positive number');
+    }
     this.limit = tokensPerDay;
+    this.maxBuckets = maxBuckets;
     this.buckets = new Map(); // key -> { tokens, day }
   }
 
@@ -93,6 +120,21 @@ export class DailyTokenBudget {
     const day = this.todayUtc();
     let bucket = this.buckets.get(key);
     if (!bucket || bucket.day !== day) {
+      // If we're at the bucket cap, sweep stale buckets (different
+      // day) first; if still full, evict the oldest. Bounds memory
+      // under attacker-controlled key floods. Trade-off: an evicted
+      // legit bucket loses its accumulated daily count and starts
+      // fresh — degraded budget enforcement, not service denial.
+      // See SECURITY.md for sizing guidance on maxBuckets.
+      if (!bucket && this.buckets.size >= this.maxBuckets) {
+        for (const [k, b] of this.buckets) {
+          if (b.day !== day) this.buckets.delete(k);
+        }
+        if (this.buckets.size >= this.maxBuckets) {
+          const oldest = this.buckets.keys().next().value;
+          this.buckets.delete(oldest);
+        }
+      }
       bucket = { tokens: 0, day };
       this.buckets.set(key, bucket);
     }
@@ -101,6 +143,10 @@ export class DailyTokenBudget {
     }
     bucket.tokens += tokens;
     return { allowed: true, used: bucket.tokens, limit: this.limit, remaining: this.limit - bucket.tokens };
+  }
+
+  size() {
+    return this.buckets.size;
   }
 }
 

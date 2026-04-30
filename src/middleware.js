@@ -79,8 +79,11 @@ export function verifyAaeMiddleware({ keyResolver, revocationChecker, nonceCache
         expectedSub: getSlug(req),
       });
     } catch (err) {
+      // Log details server-side; never include err.message in the
+      // HTTP response body (it can leak internal paths, library
+      // names, DB driver strings to a probing attacker).
       logger?.error?.({ err: err.message }, 'aae verify threw');
-      return res.status(503).json({ error: 'verify_unavailable', detail: err.message });
+      return res.status(503).json({ error: 'verify_unavailable' });
     }
 
     if (!result.verified) {
@@ -295,16 +298,31 @@ export function rateLimitMiddleware({ rateLimiter, tokenBudget, getSlug = defaul
 /**
  * Fire-and-forget audit of the final decision after the response
  * completes. Caller-supplied sink is invoked with the audit row.
+ *
+ * Defaults to logging the request PATH only (no query string).
+ * Query parameters often carry secrets (API keys, tokens, session
+ * ids) that callers may not realise are being logged. If you really
+ * need the query string, set `includeQueryInAudit: true`.
+ *
+ * If the sink throws, the failure is logged at ERROR level (was
+ * warn) — a missing audit trail has security implications and
+ * should be a noisy signal to operators, not a quiet warning.
  */
-export function auditMiddleware({ sink = null, logger = null } = {}) {
+export function auditMiddleware({ sink = null, logger = null, includeQueryInAudit = false } = {}) {
   return async function audit(req, res, next) {
     res.on('finish', () => {
       const fw = req.firewall ?? {};
+      const fullUrl = req.originalUrl ?? req.url ?? '';
+      let pathOnly = fullUrl;
+      if (!includeQueryInAudit) {
+        const q = fullUrl.indexOf('?');
+        if (q !== -1) pathOnly = fullUrl.slice(0, q);
+      }
       const row = {
         slug: req.params?.slug ?? fw.slug,
         caller: fw.callerDid,
         method: req.method,
-        path: req.originalUrl ?? req.url,
+        path: pathOnly,
         status: res.statusCode,
         rule_id: fw.aclRule?.rule_id,
         trust_score: fw.trustScore,
@@ -314,7 +332,9 @@ export function auditMiddleware({ sink = null, logger = null } = {}) {
       try {
         if (typeof sink === 'function') sink(row);
       } catch (err) {
-        logger?.warn?.({ err: err.message }, 'audit sink threw');
+        // Log at error — a silent audit-trail failure is a security
+        // incident, not a warning. Operators want this noisy.
+        logger?.error?.({ err: err.message, row }, 'audit sink threw — audit trail has gaps');
       }
       logger?.info?.(row, 'a2a request');
     });

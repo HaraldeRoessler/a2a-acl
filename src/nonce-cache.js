@@ -3,6 +3,13 @@
 //
 // Single-process; for horizontal scaling, swap to a Redis-backed
 // implementation with the same API (.seen(jti, expSec) → boolean).
+//
+// IMPORTANT: this class starts a setInterval at construction. Treat
+// it as a per-process singleton — instantiate once at server startup,
+// never inside request handlers. If you must discard a NonceCache
+// (tests, hot-reload), call `.stop()` first or the timer leaks.
+// The interval is unref'd so it won't block process exit, but the
+// memory footprint of orphaned timers and Map state is real.
 
 const MAX_ENTRIES = 10_000;
 

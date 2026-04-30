@@ -9,6 +9,7 @@
 
 const DEFAULT_TTL_POS_MS = 5 * 60 * 1000;
 const DEFAULT_TTL_NEG_MS = 30 * 1000;
+const DEFAULT_MAX_CACHE = 10_000;
 
 /**
  * Generic TTL cache around a resolver callback. Subclasses below adapt
@@ -27,13 +28,39 @@ class TtlResolver {
    *   @param {number} [opts.ttlPositiveMs]  cache duration for non-null results
    *   @param {number} [opts.ttlNegativeMs]  cache duration for null/missing results
    */
-  constructor({ resolve, ttlPositiveMs = DEFAULT_TTL_POS_MS, ttlNegativeMs = DEFAULT_TTL_NEG_MS }) {
+  constructor({ resolve, ttlPositiveMs = DEFAULT_TTL_POS_MS, ttlNegativeMs = DEFAULT_TTL_NEG_MS, maxSize = DEFAULT_MAX_CACHE }) {
     if (typeof resolve !== 'function') throw new Error('resolve callback required');
+    if (!Number.isFinite(maxSize) || maxSize <= 0) throw new Error('maxSize must be a positive number');
     this._resolve = resolve;
     this._ttlPos = ttlPositiveMs;
     this._ttlNeg = ttlNegativeMs;
+    this._maxSize = maxSize;
     this._cache = new Map();
     this._inflight = new Map(); // key -> Promise<value>
+  }
+
+  // Sweep expired entries. Called opportunistically before forced
+  // evictions so we don't displace cache lines that would have
+  // expired on their own anyway.
+  _sweepExpired() {
+    const now = Date.now();
+    for (const [k, v] of this._cache) {
+      if (v.expiresAt <= now) this._cache.delete(k);
+    }
+  }
+
+  // Bound the cache size. Bounds memory under attacker-controlled
+  // key floods (e.g. millions of unique key_id / DID values within a
+  // single TTL window). On overflow: sweep expired first, then evict
+  // the oldest unexpired entry (FIFO via Map insertion order).
+  _enforceCap() {
+    if (this._cache.size <= this._maxSize) return;
+    this._sweepExpired();
+    while (this._cache.size > this._maxSize) {
+      const oldest = this._cache.keys().next().value;
+      if (oldest === undefined) break;
+      this._cache.delete(oldest);
+    }
   }
 
   async _get(key) {
@@ -49,6 +76,7 @@ class TtlResolver {
         const value = await this._resolve(key);
         const ttl = value === null || value === undefined ? this._ttlNeg : this._ttlPos;
         this._cache.set(key, { value, expiresAt: Date.now() + ttl });
+        this._enforceCap();
         return value;
       } finally {
         // Always remove the in-flight entry — whether resolve succeeded,
@@ -127,11 +155,14 @@ export class RevocationChecker {
    * @param {object} opts
    *   @param {(jti: string) => Promise<boolean>} opts.check
    *   @param {number} [opts.ttlMs]
+   *   @param {number} [opts.maxSize]
    */
-  constructor({ check, ttlMs = DEFAULT_TTL_NEG_MS }) {
+  constructor({ check, ttlMs = DEFAULT_TTL_NEG_MS, maxSize = DEFAULT_MAX_CACHE }) {
     if (typeof check !== 'function') throw new Error('check callback required');
+    if (!Number.isFinite(maxSize) || maxSize <= 0) throw new Error('maxSize must be a positive number');
     this._check = check;
     this._ttlMs = ttlMs;
+    this._maxSize = maxSize;
     this._cache = new Map();
   }
 
@@ -140,6 +171,18 @@ export class RevocationChecker {
     if (cached && cached.expiresAt > Date.now()) return cached.revoked;
     const revoked = await this._check(jti);
     this._cache.set(jti, { revoked, expiresAt: Date.now() + this._ttlMs });
+    // Bound memory under jti flood: sweep expired, then evict oldest.
+    if (this._cache.size > this._maxSize) {
+      const now = Date.now();
+      for (const [k, v] of this._cache) {
+        if (v.expiresAt <= now) this._cache.delete(k);
+      }
+      while (this._cache.size > this._maxSize) {
+        const oldest = this._cache.keys().next().value;
+        if (oldest === undefined) break;
+        this._cache.delete(oldest);
+      }
+    }
     return revoked;
   }
 
