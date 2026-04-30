@@ -1,5 +1,149 @@
 # Changelog
 
+## 0.1.3 — 2026-04-30
+
+Third-pass security review. Two external reviewers (independently)
+found 20 issues; all addressed.
+
+### Fixed (CRITICAL)
+
+- **Cross-peer replay via missing sub validation** (`aae.js`,
+  `middleware.js`). `verifyAae` previously accepted `expectedSub`
+  in its config but never validated `env.sub` against it — meaning
+  any envelope captured for peer alice could be replayed against
+  peer bob within the same audience and expiry window. Worse, an
+  envelope with `sub` omitted entirely worked against any peer.
+  Now: when `expectedSub` is set, `env.sub` MUST be present and
+  match. Middleware exposes a new `getExpectedSub` callback (opt-in,
+  no breaking default — previous middleware passed `getSlug` as
+  expectedSub, which was set-but-ignored).
+
+- **NaN bypass in time / hop / score / token validation**
+  (`aae.js`, `middleware.js`, `rate-limit.js`, `resolvers.js`,
+  `nonce-cache.js`). `typeof NaN === 'number'`, so envelope fields
+  with NaN passed every type check. Comparisons against NaN are
+  always false (`NaN < x` and `NaN > x` both false), so NaN-laced
+  fields BYPASSED:
+    - exp / iat (envelope time checks)
+    - hop (recursion depth guard)
+    - trust score (gate)
+    - Content-Length (token budget — bucket got poisoned)
+  Plus `nonceCache.seen(jti, NaN)` permanently saturated the cache
+  because `NaN <= now` is false in sweep. Now: every numeric path
+  uses `Number.isFinite()` defensively, and NonceCache.sweep treats
+  any non-finite expiry as expired.
+
+- **`key_resolver_failed` colon-mismatch regression**
+  (`middleware.js`). 0.1.2 changed the verify-side reason from
+  `key_resolver_failed:<message>` to a clean `key_resolver_failed`,
+  but the middleware still checked `startsWith('key_resolver_failed:')`
+  (note the colon). The 503 path was unreachable; resolver failures
+  silently fell through to the generic 401 `aae_rejected`, hiding
+  transient backend outages and potentially causing callers to
+  rotate good envelopes instead of retrying. Fixed.
+
+### Fixed (HIGH)
+
+- **TtlResolver `_inflight` Map unbounded** (`resolvers.js`). 0.1.2
+  capped `_cache` but `_inflight` had no bound — an attacker
+  flooding requests with unique sig_key_id values, each evicted
+  from the bounded cache, could create unbounded pending promises
+  each holding a slow resolver call. Now: `maxInflight` cap
+  (default 1,000) on both `TtlResolver` and `RevocationChecker`.
+  Throws `inflight_cap_exceeded` when full → propagates to
+  fail-closed at the verify step.
+
+- **`perm` field never type-validated** (`aae.js`). `SIGNED_FIELDS`
+  included 'perm' but `env.perm` was passed through unchecked. An
+  attacker setting `perm: "evil-string"` would survive into
+  `result.perm`, where `coversOp` would iterate individual
+  characters or potentially throw. Now: rejected as
+  `perm_invalid_type` if not an array.
+
+### Fixed (MEDIUM)
+
+- **`canonicalize` export diverges from verifier logic**
+  (`aae.js`). Cross-language signers reading the exported
+  `canonicalize` source might replicate "sort all keys" behavior
+  and miss the SIGNED_FIELDS allowlist, producing payloads the
+  verifier won't accept. Now: `signablePayload(env)` exported as
+  the single source of truth, plus `SIGNED_FIELDS` exported as a
+  frozen const. `canonicalize` doc-marked as low-level.
+
+- **Audit sink async rejections unhandled** (`middleware.js`).
+  Previous code wrapped `sink(row)` in a synchronous try/catch.
+  An async sink returning a rejected Promise was NOT caught and
+  could crash Node under `--unhandled-rejections=strict`. Now:
+  `Promise.resolve(sink(row)).catch(...)` funnels both sync
+  throws and async rejections into the error logger.
+
+- **ROLE_FLIPS regex `g`-flag state risk** (`sanitise.js`).
+  Used `.test()` on a shared regex with the `/g` flag — `lastIndex`
+  state is mutable and shared across requests. Future refactoring
+  could miss matches. Now: fresh RegExp per call, matching the
+  defensive pattern already used for OVERRIDE_PHRASES.
+
+- **`sanitiseDeep` didn't sanitise object keys** (`sanitise.js`).
+  Property names like `"system: "` or those carrying invisible
+  unicode could survive into downstream contexts. Now: keys are
+  sanitised too.
+
+### Fixed (LOW)
+
+- **Trust score / threshold leaked in 403 response body**
+  (`middleware.js`). Returning these gave attackers a precise
+  oracle for probing what their score is and how close to the
+  threshold. Now: `{"error":"trust_score_below_threshold"}` only;
+  scores logged server-side.
+
+- **`threshold_override` accepted out-of-range values**
+  (`middleware.js`). `-1`, `Infinity`, `1.1` would silently apply,
+  letting any/no scores pass. Now: `Number.isFinite && >= 0 && <=
+  1` validation; out-of-range falls back to gateway default.
+
+- **Unbounded string fields on AAE envelope** (`aae.js`). `iss`,
+  `sub`, `jti`, `aud`, `sig_key_id` had no length cap — outsized
+  signer values flowed into audit logs, ACL queries, response
+  bodies. Now: 256-char cap with explicit `*_too_long` reasons.
+
+- **Rate-limit key collision via `|`** (`middleware.js`). The
+  composite key `${callerDid}|${slug}` would collide if a DID
+  contained `|`. Now: JSON-encoded tuple — `["a|b","c"]` is
+  unambiguously different from `["a","b|c"]`.
+
+- **Public path detection failed when middleware mounted under a
+  path** (`middleware.js`). When `app.use('/api/a2a', firewallChain
+  (...))`, Express set `req.path` to the path AFTER the mount
+  (e.g. `/agent-card`). The PUBLIC_PATHS set contained
+  `/api/a2a/agent-card`, so agent-card discovery incorrectly
+  required AAE auth. Now: combines `req.baseUrl + req.path` for
+  matching, plus suffix-based fallback for the `agent-card` path.
+
+- **CircuitBreaker.state Map had no bound** (`rate-limit.js`).
+  Slugs aren't typically attacker-controlled, but consistency with
+  the other state-tracker caps. Now: `maxPeers` (default 10,000)
+  with FIFO eviction.
+
+- **RateLimiter bucket `Array.shift()` in a loop**
+  (`rate-limit.js`). `shift()` is O(n) per call; high-volume
+  bucket pruning was O(n²). Replaced with a single `splice`.
+
+### Added
+
+- 27 new regression tests (`test/security-3.test.js`) covering
+  every fix above, including a real Express + fetch test for the
+  public-path-under-mount fix and the 503 colon-mismatch fix.
+- Total tests: 74 (47 from 0.1.2 + 27 new); all pass.
+
+### Changed (intentional behaviour)
+
+- `verifyAaeMiddleware` no longer passes `expectedSub: getSlug(req)`
+  by default. The 0.1.2 default was set-but-ignored (sub was never
+  validated by `verifyAae`), so this is not a real breaking change
+  for callers. Once you understand your signer's sub convention
+  (DID? slug? something else?), opt in to validation by setting
+  the `getExpectedSub` callback. See SECURITY.md for guidance.
+
 ## 0.1.2 — 2026-04-30
 
 Second-pass security review. 10 issues found by external review;

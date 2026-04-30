@@ -140,20 +140,35 @@ In `verifyAae`:
 
 - `expectedAud` is required to match (default `'a2a-ingress'`; pass
   `null` to disable, NOT recommended)
+- `expectedSub` is opt-in. When set, `env.sub` MUST match exactly
+  — defends against cross-peer replay. Strongly recommended to opt
+  in once your signer's sub convention is known.
 - `requireExp` defaults to true
 - `maxLifetimeSec` defaults to 300 (5 minutes) — envelopes claiming
   longer validity are rejected
 - `iatSkewSec` defaults to 60 — clock skew tolerance window
-- Canonicalisation uses a strict allowlist of envelope fields. Extra
-  keys (including `__proto__`) on the parsed envelope are not signed
-  over and not trusted.
+- All numeric fields are validated with `Number.isFinite` — NaN,
+  +Infinity, -Infinity are explicitly rejected
+- All string fields are length-capped at 256 chars (rejected with
+  `*_too_long` reason)
+- `perm` is type-checked as an array
+- Canonicalisation uses a strict allowlist of envelope fields
+  (`SIGNED_FIELDS`). Extra keys (including `__proto__`) on the
+  parsed envelope are not signed over and not trusted. Cross-language
+  signers should use `signablePayload(env)` as the single source of
+  truth.
 
 In rate-limit / token-budget / resolvers:
 
 - `RateLimiter.maxBuckets` defaults to 100,000
 - `DailyTokenBudget.maxBuckets` defaults to 100,000
-- `TtlResolver.maxSize` defaults to 10,000
+- `TtlResolver.maxSize` defaults to 10,000 (cache)
+- `TtlResolver.maxInflight` defaults to 1,000 (in-flight promises)
 - `RevocationChecker.maxSize` defaults to 10,000
+- `RevocationChecker.maxInflight` defaults to 1,000 (with concurrent-jti dedup)
+- `CircuitBreaker.maxPeers` defaults to 10,000
+- `Content-Length` header values that are not finite + non-negative
+  numbers are dropped (no NaN/Infinity poisoning of the bucket)
 
 These caps bound memory under attacker-controlled key floods.
 Sizing guidance: pick a bound that comfortably exceeds your
@@ -180,6 +195,23 @@ In `auditMiddleware`:
   `includeQueryInAudit: true` to opt in.
 - Sink failure is logged at **error** level (was warn) — a silent
   audit-trail gap is a security incident.
+- Async sink rejections are caught and logged at error level (won't
+  crash the process under `--unhandled-rejections=strict`).
+
+In `trustScoreGateMiddleware`:
+
+- Out-of-range `threshold_override` (negative, > 1, non-finite) is
+  ignored; falls back to the gateway default. Defends against
+  malformed ACL rows silently driving the gate.
+- 403 response body does NOT include the score or threshold —
+  returning them is a precise oracle for an attacker probing the
+  trust formula.
+
+In `auditMiddleware` and `rateLimitMiddleware`:
+
+- Composite keys are JSON-encoded tuples (`[callerDid, slug]`)
+  rather than `${did}|${slug}` — defends against collision attacks
+  where a crafted DID contains the chosen separator.
 
 You can relax these for migration compatibility, but the library
 defaults to "fail closed".

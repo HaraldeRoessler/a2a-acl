@@ -60,7 +60,14 @@ export class RateLimiter {
       bucket = [];
       this.buckets.set(key, bucket);
     }
-    while (bucket.length > 0 && bucket[0] < cutoff) bucket.shift();
+    // Splice once instead of shift() in a loop — shift() is O(n) per
+    // call, so a high-volume bucket pruning was O(n²). splice with
+    // the cutoff index is O(n).
+    if (bucket.length > 0 && bucket[0] < cutoff) {
+      let idx = 0;
+      while (idx < bucket.length && bucket[idx] < cutoff) idx += 1;
+      bucket.splice(0, idx);
+    }
     if (bucket.length >= this.limit) return false;
     bucket.push(now);
     return true;
@@ -69,7 +76,11 @@ export class RateLimiter {
   sweep() {
     const cutoff = Date.now() - this.windowMs;
     for (const [k, bucket] of this.buckets) {
-      while (bucket.length > 0 && bucket[0] < cutoff) bucket.shift();
+      if (bucket.length > 0 && bucket[0] < cutoff) {
+        let idx = 0;
+        while (idx < bucket.length && bucket[idx] < cutoff) idx += 1;
+        bucket.splice(0, idx);
+      }
       if (bucket.length === 0) this.buckets.delete(k);
     }
   }
@@ -107,9 +118,18 @@ export class DailyTokenBudget {
   }
 
   estimate(req) {
-    // Rough heuristic: every 4 bytes of body ≈ 1 token.
+    // Rough heuristic: every 4 bytes of body ≈ 1 token. Be defensive:
+    // an attacker could send `Content-Length: NaN` (or Infinity, or
+    // negative). Number(...) returns NaN for "NaN" / unparseable.
+    // Without isFinite() we'd push NaN downstream, where consume()
+    // does `bucket.tokens + tokens` → NaN, then `NaN > limit` is
+    // always false → request always allowed → budget is poisoned for
+    // that key forever.
     const len = req.headers && req.headers['content-length'];
-    if (typeof len === 'string') return Math.ceil(Number(len) / 4);
+    if (typeof len === 'string') {
+      const n = Number(len);
+      if (Number.isFinite(n) && n >= 0) return Math.ceil(n / 4);
+    }
     if (req.body) {
       try { return Math.ceil(JSON.stringify(req.body).length / 4); } catch { /* fall through */ }
     }
@@ -117,6 +137,10 @@ export class DailyTokenBudget {
   }
 
   consume(key, tokens) {
+    // Defensive guard: only finite, non-negative token counts ever
+    // mutate bucket state. NaN/Infinity/negative would poison the
+    // bucket via `bucket.tokens += tokens`.
+    if (!Number.isFinite(tokens) || tokens < 0) tokens = 0;
     const day = this.todayUtc();
     let bucket = this.buckets.get(key);
     if (!bucket || bucket.day !== day) {
@@ -160,9 +184,10 @@ const DEFAULT_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
 
 export class CircuitBreaker {
-  constructor({ threshold = DEFAULT_THRESHOLD, cooldownMs = DEFAULT_COOLDOWN_MS } = {}) {
+  constructor({ threshold = DEFAULT_THRESHOLD, cooldownMs = DEFAULT_COOLDOWN_MS, maxPeers = 10_000 } = {}) {
     this.threshold = threshold;
     this.cooldownMs = cooldownMs;
+    this.maxPeers = maxPeers;
     this.state = new Map(); // slug -> { consecutive429s, openUntil }
   }
 
@@ -179,7 +204,17 @@ export class CircuitBreaker {
   record(slug, status) {
     let s = this.state.get(slug);
     if (status === 429) {
-      if (!s) s = { consecutive429s: 0, openUntil: null };
+      if (!s) {
+        // Bound peer-state map. Slugs aren't typically attacker-
+        // controlled but keeping consistency with the other
+        // bucket-cap defenses. On overflow, evict the oldest
+        // (peer with the longest-passed last-update).
+        if (this.state.size >= this.maxPeers) {
+          const oldest = this.state.keys().next().value;
+          if (oldest !== undefined) this.state.delete(oldest);
+        }
+        s = { consecutive429s: 0, openUntil: null };
+      }
       s.consecutive429s += 1;
       if (s.consecutive429s >= this.threshold) {
         s.openUntil = Date.now() + this.cooldownMs;
@@ -189,6 +224,10 @@ export class CircuitBreaker {
       // Any non-5xx-non-429 resets the counter.
       if (s) this.state.delete(slug);
     }
+  }
+
+  size() {
+    return this.state.size;
   }
 
   cooldownRemaining(slug) {

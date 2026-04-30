@@ -15,7 +15,12 @@
 //     expectedAud: 'a2a-ingress', basePath: '/api/a2a',
 //   }));
 
-export { verifyAae, canonicalize } from './aae.js';
+export {
+  verifyAae,
+  canonicalize,
+  signablePayload,
+  SIGNED_FIELDS,
+} from './aae.js';
 export { NonceCache } from './nonce-cache.js';
 export { sanitiseString, sanitiseDeep } from './sanitise.js';
 export {

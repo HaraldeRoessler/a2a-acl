@@ -42,8 +42,17 @@ const PUBLIC_PATHS = new Set([
 ]);
 
 function isPublic(req, basePath = '/api/a2a') {
+  // When the chain is mounted via app.use('/api/a2a', ...), Express
+  // sets req.path to the path AFTER the mount — e.g. '/agent-card'.
+  // Combining baseUrl + path reconstructs the original path so
+  // PUBLIC_PATHS still matches. originalUrl is also valid but may
+  // include a query string.
+  const fullPath = (req.baseUrl || '') + (req.path || '');
+  if (PUBLIC_PATHS.has(fullPath)) return true;
   if (PUBLIC_PATHS.has(req.path)) return true;
-  if (basePath && req.path === `${basePath}/agent-card`) return true;
+  // Allow shorthand match against the configured basePath too.
+  if (basePath && (req.path === `${basePath}/agent-card` || fullPath === `${basePath}/agent-card`)) return true;
+  if (req.path === '/agent-card' || fullPath.endsWith('/agent-card')) return true;
   return false;
 }
 
@@ -53,8 +62,21 @@ function isPublic(req, basePath = '/api/a2a') {
  * Verify the X-Klaw-AAE / X-AAE envelope. On success populates
  * req.firewall.aae + req.firewall.callerDid. On failure: 401 (or 503
  * if the key resolver had a transient error).
+ *
+ * If you provide `getExpectedSub`, the verifier enforces that
+ * env.sub equals what the callback returns. This is the defence
+ * against cross-peer replay (an envelope captured for peer alice
+ * cannot be replayed against peer bob). Default: not validated
+ * (advisory-only) — opt-in once your signer convention is known.
  */
-export function verifyAaeMiddleware({ keyResolver, revocationChecker, nonceCache, expectedAud, getSlug = defaultGetSlug, basePath = '/api/a2a', logger = null }) {
+export function verifyAaeMiddleware({
+  keyResolver, revocationChecker, nonceCache,
+  expectedAud,
+  getExpectedSub,
+  getSlug = defaultGetSlug,
+  basePath = '/api/a2a',
+  logger = null,
+}) {
   if (!keyResolver) throw new Error('verifyAaeMiddleware requires keyResolver');
   if (!revocationChecker) throw new Error('verifyAaeMiddleware requires revocationChecker');
   if (!nonceCache) throw new Error('verifyAaeMiddleware requires nonceCache');
@@ -75,8 +97,8 @@ export function verifyAaeMiddleware({ keyResolver, revocationChecker, nonceCache
         keyResolver,
         revocationChecker,
         nonceCache,
-        expectedAud: expectedAud ?? 'a2a-ingress',
-        expectedSub: getSlug(req),
+        expectedAud: expectedAud === null ? null : (expectedAud ?? 'a2a-ingress'),
+        expectedSub: typeof getExpectedSub === 'function' ? getExpectedSub(req) : undefined,
       });
     } catch (err) {
       // Log details server-side; never include err.message in the
@@ -93,8 +115,13 @@ export function verifyAaeMiddleware({ keyResolver, revocationChecker, nonceCache
         issuer: result.issuer,
         slug: getSlug(req),
       }, 'aae rejected');
-      if (typeof result.reason === 'string' && result.reason.startsWith('key_resolver_failed:')) {
-        return res.status(503).json({ error: 'key_resolver_unavailable', reason: result.reason });
+      // Resolver failure → 503 so callers retry. The verify side
+      // returns the reason as exactly 'key_resolver_failed' (no
+      // colon-suffixed details). Match exactly to avoid the bug
+      // from 0.1.2 where startsWith('key_resolver_failed:') was
+      // never true and the 503 path was unreachable.
+      if (result.reason === 'key_resolver_failed') {
+        return res.status(503).json({ error: 'key_resolver_unavailable' });
       }
       return res.status(401).json({ error: 'aae_rejected', reason: result.reason });
     }
@@ -183,14 +210,33 @@ export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7
       return res.status(503).json({ error: 'trust_resolver_unavailable' });
     }
 
+    // NaN/Infinity defence: every comparison with NaN is false, so a
+    // resolver returning NaN (whether through a buggy backend or a
+    // malicious record) would silently bypass the gate. TrustResolver
+    // already coerces NaN → 0, but defend in depth here too.
+    if (!Number.isFinite(score)) {
+      logger?.error?.({ did, score }, 'trust score resolver returned non-finite');
+      return res.status(503).json({ error: 'trust_resolver_unavailable' });
+    }
+
+    // Range-validate the rule's threshold_override. A malformed ACL
+    // row with -1 / +Inf / 1.1 should not silently drive the gate —
+    // fall back to the gateway default.
     const override = fw.aclRule?.threshold_override;
-    const threshold = typeof override === 'number' ? override : defaultThreshold;
+    let threshold = defaultThreshold;
+    let source = 'gateway_default';
+    if (Number.isFinite(override) && override >= 0 && override <= 1) {
+      threshold = override;
+      source = 'rule_override';
+    }
+
     if (score < threshold) {
-      logger?.warn?.({
-        did, score, threshold,
-        source: typeof override === 'number' ? 'rule_override' : 'gateway_default',
-      }, 'trust gate denied');
-      return res.status(403).json({ error: 'trust_score_below_threshold', score, threshold });
+      logger?.warn?.({ did, score, threshold, source }, 'trust gate denied');
+      // Don't include score / threshold in the response body —
+      // returning them is a precise oracle for an attacker probing
+      // how close they are to passing or what the trust formula
+      // weights. Log server-side; tell the client the bare result.
+      return res.status(403).json({ error: 'trust_score_below_threshold' });
     }
     fw.trustScore = score;
     next();
@@ -230,9 +276,12 @@ export function depthGuardMiddleware({ maxHopCount = 3, logger = null } = {}) {
     const fw = ensureFirewall(req);
     if (fw.public) return next();
     const hop = fw.aae?.hop ?? 0;
-    if (hop > maxHopCount) {
+    // NaN > x is always false in JS. aae.js already validates env.hop
+    // is a finite number before populating it; this is defence in
+    // depth in case an upstream stage tampered with fw.aae.
+    if (!Number.isFinite(hop) || hop > maxHopCount) {
       logger?.warn?.({ hop, max: maxHopCount, did: fw.callerDid }, 'depth guard rejected');
-      return res.status(403).json({ error: 'recursion_depth_exceeded', hop, max: maxHopCount });
+      return res.status(403).json({ error: 'recursion_depth_exceeded', max: maxHopCount });
     }
     next();
   };
@@ -268,7 +317,11 @@ export function rateLimitMiddleware({ rateLimiter, tokenBudget, getSlug = defaul
     const fw = ensureFirewall(req);
     if (fw.public) return next();
     const slug = getSlug(req);
-    const key = `${fw.callerDid}|${slug}`;
+    // JSON-encode the tuple instead of `${a}|${b}` — defends
+    // against collision attacks where an attacker crafts a callerDid
+    // containing the chosen separator. With JSON.stringify the
+    // outputs are unambiguous: ["a|b","c"] !== ["a","b|c"].
+    const key = JSON.stringify([fw.callerDid, slug]);
 
     if (!rateLimiter.consume(key)) {
       logger?.warn?.({ did: fw.callerDid, slug, limit: rateLimiter.limit }, 'rate limit exceeded');
@@ -329,12 +382,27 @@ export function auditMiddleware({ sink = null, logger = null, includeQueryInAudi
         sanitise_hits: fw.sanitiseHits,
         token_used: fw.tokenUsed,
       };
-      try {
-        if (typeof sink === 'function') sink(row);
-      } catch (err) {
-        // Log at error — a silent audit-trail failure is a security
-        // incident, not a warning. Operators want this noisy.
-        logger?.error?.({ err: err.message, row }, 'audit sink threw — audit trail has gaps');
+      // The sink may be async (writing to a DB, posting to a queue).
+      // A synchronous try/catch does NOT catch a rejected Promise,
+      // so an async sink that fails would surface as an unhandled
+      // promise rejection — and Node may crash with
+      // --unhandled-rejections=strict. Wrap with Promise.resolve so
+      // both sync throws and async rejections funnel into the same
+      // error logger.
+      if (typeof sink === 'function') {
+        try {
+          Promise.resolve(sink(row)).catch((err) => {
+            logger?.error?.(
+              { err: err?.message ?? String(err), row },
+              'audit sink rejected — audit trail has gaps',
+            );
+          });
+        } catch (err) {
+          logger?.error?.(
+            { err: err?.message ?? String(err), row },
+            'audit sink threw — audit trail has gaps',
+          );
+        }
       }
       logger?.info?.(row, 'a2a request');
     });

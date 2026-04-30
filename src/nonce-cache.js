@@ -52,7 +52,13 @@ export class NonceCache {
   sweep() {
     const now = Math.floor(Date.now() / 1000);
     for (const [jti, exp] of this.cache) {
-      if (exp <= now) this.cache.delete(jti);
+      // Belt-and-braces: aae.js validates exp is a finite number
+      // before passing it here, but if a caller uses NonceCache
+      // directly they could pass NaN/Infinity which would never
+      // satisfy `exp <= now` (NaN comparisons are always false).
+      // Treat any non-finite expiry as expired so it can't poison
+      // the cache permanently.
+      if (!Number.isFinite(exp) || exp <= now) this.cache.delete(jti);
     }
   }
 

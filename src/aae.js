@@ -17,12 +17,40 @@ import { verify as cryptoVerify, createPublicKey } from 'node:crypto';
 // signature. Anything else in the parsed JSON is ignored — never
 // signed over, never trusted. Adding a new field is a breaking change
 // that requires a coordinated bump (env.v + library version).
-const SIGNED_FIELDS = [
+//
+// Exported as a const + via signablePayload() so signers in any
+// language have one source of truth: build the canonical payload by
+// enumerating these fields in this order, ignoring everything else.
+export const SIGNED_FIELDS = Object.freeze([
   'v', 'iss', 'sub', 'aud',
   'exp', 'iat', 'jti',
   'sig_key_id', 'sig_alg',
   'hop', 'perm',
-];
+]);
+
+// Length caps on string envelope fields. Defends downstream consumers
+// (audit log, matchAcl callback, rate-limit key, error responses) from
+// log-injection / DB-bloat / memory-pressure via outsized signer fields.
+const MAX_STRING_FIELD_LEN = 256;
+
+function isFiniteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * Build the canonical bytes that a signer MUST sign over.
+ * Single source of truth for cross-language signer correctness.
+ *
+ * @param {object} env — the parsed envelope (without `sig`)
+ * @returns {Buffer} canonical UTF-8 bytes
+ */
+export function signablePayload(env) {
+  const signed = {};
+  for (const k of SIGNED_FIELDS) {
+    if (Object.hasOwn(env, k)) signed[k] = env[k];
+  }
+  return Buffer.from(canonicalize(signed), 'utf8');
+}
 
 function b64urlDecode(s) {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -96,6 +124,7 @@ function pubKeyFromB64Url(b64url) {
  *   @param {object} ctx.revocationChecker   — { isRevoked: async (jti) => boolean }
  *   @param {object} ctx.nonceCache          — { seen: (jti, expSec) => boolean | 'cache_full' }
  *   @param {string} [ctx.expectedAud='a2a-ingress'] — required match; pass `null` to disable (NOT recommended)
+ *   @param {string} [ctx.expectedSub]       — if set, env.sub MUST match this exact string. Defends against cross-peer replay.
  *   @param {boolean} [ctx.requireExp=true]  — require env.exp present
  *   @param {number} [ctx.maxLifetimeSec=300] — reject envelopes whose exp is more than this far in the future
  *   @param {number} [ctx.iatSkewSec=60]     — clock-skew tolerance for env.iat
@@ -103,6 +132,7 @@ function pubKeyFromB64Url(b64url) {
  */
 export async function verifyAae(headerVal, ctx) {
   const expectedAud = ctx.expectedAud === null ? null : (ctx.expectedAud ?? 'a2a-ingress');
+  const expectedSub = ctx.expectedSub == null ? null : ctx.expectedSub;
   const requireExp = ctx.requireExp !== false;
   const maxLifetimeSec = ctx.maxLifetimeSec ?? 300;
   const iatSkewSec = ctx.iatSkewSec ?? 60;
@@ -122,15 +152,30 @@ export async function verifyAae(headerVal, ctx) {
   if (env.v !== 1) return fail('unsupported_version');
 
   // Type-validate critical fields BEFORE using them. A buggy/malicious
-  // issuer that sends "1700000000" (string) for exp would otherwise
-  // silently pass via JS type coercion in comparisons.
+  // issuer sending "1700000000" (string) for exp would otherwise
+  // silently pass via JS type coercion. NaN passes typeof===number
+  // but breaks every comparison (NaN<x and NaN>x are both false), so
+  // we use Number.isFinite to reject NaN/+Inf/-Inf for any field
+  // that participates in time-window or comparison logic.
   if (env.iss != null && typeof env.iss !== 'string') return fail('iss_invalid_type');
   if (env.sub != null && typeof env.sub !== 'string') return fail('sub_invalid_type');
   if (env.jti != null && typeof env.jti !== 'string') return fail('jti_invalid_type');
   if (env.aud != null && typeof env.aud !== 'string') return fail('aud_invalid_type', { issuer: env.iss });
-  if (env.exp != null && typeof env.exp !== 'number') return fail('exp_invalid_type', { issuer: env.iss, jti: env.jti });
-  if (env.iat != null && typeof env.iat !== 'number') return fail('iat_invalid_type', { issuer: env.iss, jti: env.jti });
-  if (env.hop != null && typeof env.hop !== 'number') return fail('hop_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.sig_key_id != null && typeof env.sig_key_id !== 'string') return fail('key_id_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.sig_alg != null && typeof env.sig_alg !== 'string') return fail('sig_alg_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.exp != null && !isFiniteNumber(env.exp)) return fail('exp_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.iat != null && !isFiniteNumber(env.iat)) return fail('iat_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.hop != null && !isFiniteNumber(env.hop)) return fail('hop_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.perm != null && !Array.isArray(env.perm)) return fail('perm_invalid_type', { issuer: env.iss, jti: env.jti });
+
+  // String-field length caps. Outsized signer values flow into
+  // audit logs, ACL lookups, rate-limit keys, response bodies — bound
+  // memory + log-injection risk at the entry point.
+  if (typeof env.iss === 'string' && env.iss.length > MAX_STRING_FIELD_LEN) return fail('iss_too_long', { jti: env.jti });
+  if (typeof env.sub === 'string' && env.sub.length > MAX_STRING_FIELD_LEN) return fail('sub_too_long', { issuer: env.iss, jti: env.jti });
+  if (typeof env.jti === 'string' && env.jti.length > MAX_STRING_FIELD_LEN) return fail('jti_too_long', { issuer: env.iss });
+  if (typeof env.aud === 'string' && env.aud.length > MAX_STRING_FIELD_LEN) return fail('aud_too_long', { issuer: env.iss, jti: env.jti });
+  if (typeof env.sig_key_id === 'string' && env.sig_key_id.length > MAX_STRING_FIELD_LEN) return fail('key_id_too_long', { issuer: env.iss, jti: env.jti });
 
   // Audience: when expectedAud is set, env.aud MUST be present AND match.
   // Skipping the check when env.aud is missing would let an audless envelope
@@ -139,6 +184,17 @@ export async function verifyAae(headerVal, ctx) {
   if (expectedAud !== null) {
     if (typeof env.aud !== 'string' || env.aud !== expectedAud) {
       return fail('wrong_audience', { issuer: env.iss, jti: env.jti });
+    }
+  }
+
+  // Subject: when expectedSub is set, env.sub MUST be present AND
+  // match. Defends against cross-peer replay — an envelope captured
+  // for peer alice cannot be replayed against peer bob within the
+  // same audience and expiry window. If the caller doesn't pass
+  // expectedSub, sub is unvalidated (advisory-only).
+  if (expectedSub !== null) {
+    if (typeof env.sub !== 'string' || env.sub !== expectedSub) {
+      return fail('wrong_subject', { issuer: env.iss, jti: env.jti });
     }
   }
 
@@ -209,14 +265,10 @@ export async function verifyAae(headerVal, ctx) {
     return fail('key_format_error', { issuer: env.iss, jti: env.jti });
   }
 
-  // Build the SIGNED VIEW from the allowlist only. Anything else in
-  // the parsed envelope (including __proto__, constructor, future
-  // experimental fields) is not signed over and not trusted.
-  const signed = {};
-  for (const k of SIGNED_FIELDS) {
-    if (Object.hasOwn(env, k)) signed[k] = env[k];
-  }
-  const payload = Buffer.from(canonicalize(signed), 'utf8');
+  // Build the canonical signed bytes from the allowlist only.
+  // signablePayload() is the single source of truth — also exported
+  // so signers in any language can construct identical bytes.
+  const payload = signablePayload(env);
   const sig = env.sig;
   if (typeof sig !== 'string') return fail('sig_missing', { issuer: env.iss, jti: env.jti });
   let sigBuf;
@@ -236,5 +288,9 @@ export async function verifyAae(headerVal, ctx) {
   return ok(env);
 }
 
-// Exported so callers can reproduce the canonical bytes for issuance.
+// Low-level helper exported for advanced callers. Most signers should
+// use `signablePayload(env)` instead — it enforces the SIGNED_FIELDS
+// allowlist. Calling `canonicalize` on a raw envelope (including any
+// keys the parser produces) will diverge from what the verifier signs
+// over.
 export { canonicalize };

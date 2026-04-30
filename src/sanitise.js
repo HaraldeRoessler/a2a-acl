@@ -53,8 +53,13 @@ export function sanitiseString(s) {
   out = out.replace(INVISIBLES, '');
   if (out.length !== beforeInv) hits += 1;
 
-  if (ROLE_FLIPS.test(out)) {
-    out = out.replace(ROLE_FLIPS, (_m, role) => `${STRIP_NOTE} ${role} :`);
+  // Build a fresh regex per call. ROLE_FLIPS has the /g flag which
+  // means RegExp.test() advances `lastIndex` between calls — sharing
+  // state across requests would cause missed matches. Same defensive
+  // pattern as OVERRIDE_PHRASES below.
+  const roleFlipsRe = new RegExp(ROLE_FLIPS.source, ROLE_FLIPS.flags);
+  if (roleFlipsRe.test(out)) {
+    out = out.replace(new RegExp(ROLE_FLIPS.source, ROLE_FLIPS.flags), (_m, role) => `${STRIP_NOTE} ${role} :`);
     hits += 1;
   }
 
@@ -91,9 +96,14 @@ export function sanitiseDeep(v) {
     const out = {};
     let hits = 0;
     for (const [k, vv] of Object.entries(v)) {
-      const { value, hits: h } = sanitiseDeep(vv);
-      out[k] = value;
-      hits += h;
+      // Sanitise keys too. JSON keys rarely reach LLM prompt context
+      // but a property name like "system: " or one carrying invisible
+      // unicode could survive into downstream prompts depending on
+      // how the receiver renders the request. Cheap to defend.
+      const { value: sanitisedKey, hits: kh } = sanitiseString(k);
+      const { value: sanitisedVal, hits: vh } = sanitiseDeep(vv);
+      out[sanitisedKey] = sanitisedVal;
+      hits += kh + vh;
     }
     return { value: out, hits };
   }
