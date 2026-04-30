@@ -178,6 +178,15 @@ others building agent infrastructure don't have to roll their own.
 If you find a bug, open an issue. If you want it adapted to your
 stack, send a PR.
 
+## Security
+
+Defaults are strict: audience required, expiry required, max envelope
+lifetime 5 minutes, only Ed25519 accepted, replay-cache fail-closed
+when full. See [SECURITY.md](./SECURITY.md) for the full threat
+model, the things this library does NOT defend against (SQL injection
+in your callbacks, body-size attacks, prompt injection beyond known
+markers, multi-replica replay), and how to report a vulnerability.
+
 ## License
 
 [MIT](./LICENSE).

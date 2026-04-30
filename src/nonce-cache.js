@@ -15,15 +15,28 @@ export class NonceCache {
   }
 
   /**
-   * Returns true if this is the FIRST time we've seen this jti
-   * (caller should accept). Returns false on replay.
+   * Returns:
+   *   true          — first sight, caller should accept
+   *   false         — replay, caller must reject
+   *   'cache_full'  — sweep ran but cache is still saturated; caller
+   *                   must reject (fail-closed). Evicting the oldest
+   *                   entry would create a replay window for envelopes
+   *                   the attacker can keep alive past our memory of
+   *                   their jti.
+   *
+   * If you're seeing 'cache_full' regularly, raise `maxEntries` or
+   * shorten envelope `exp` so entries naturally drain.
    */
   seen(jti, expSec) {
     if (this.cache.has(jti)) return false;
     if (this.cache.size >= this.maxEntries) {
-      // Drop oldest (Map iteration order = insertion order).
-      const oldest = this.cache.keys().next().value;
-      this.cache.delete(oldest);
+      // Try to make room by sweeping expired entries first.
+      this.sweep();
+      if (this.cache.size >= this.maxEntries) {
+        // Still full → fail-closed. We cannot evict an unexpired entry
+        // without opening a replay hole.
+        return 'cache_full';
+      }
     }
     this.cache.set(jti, expSec);
     return true;

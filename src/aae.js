@@ -68,17 +68,30 @@ function pubKeyFromB64Url(b64url) {
 /**
  * Verify an X-AAE header against caller-supplied trust rules.
  *
+ * Defaults are deliberately strict — `aud` and `exp` are required, max
+ * envelope lifetime is 5 minutes, only Ed25519 signatures accepted. A
+ * caller working with a more permissive issuer (e.g. for migration
+ * compatibility) can relax via the options below, but the library
+ * defaults to "fail closed".
+ *
  * @param {string|undefined} headerVal       — raw header value (base64url JSON)
  * @param {object} ctx
  *   @param {object} ctx.keyResolver         — { resolve: async (key_id) => {public_key_b64url, sig_alg} | null }
  *   @param {object} ctx.revocationChecker   — { isRevoked: async (jti) => boolean }
- *   @param {object} ctx.nonceCache          — { seen: (jti, expSec) => boolean (true if first time) }
- *   @param {string} [ctx.expectedAud]       — defaults to 'a2a-ingress'
+ *   @param {object} ctx.nonceCache          — { seen: (jti, expSec) => boolean | 'cache_full' }
+ *   @param {string} [ctx.expectedAud='a2a-ingress'] — required match; pass `null` to disable (NOT recommended)
+ *   @param {boolean} [ctx.requireExp=true]  — require env.exp present
+ *   @param {number} [ctx.maxLifetimeSec=300] — reject envelopes whose exp is more than this far in the future
+ *   @param {number} [ctx.iatSkewSec=60]     — clock-skew tolerance for env.iat
  * @returns {Promise<object>} verification summary
  */
 export async function verifyAae(headerVal, ctx) {
-  const expectedAud = ctx.expectedAud ?? 'a2a-ingress';
-  if (!headerVal) {
+  const expectedAud = ctx.expectedAud === null ? null : (ctx.expectedAud ?? 'a2a-ingress');
+  const requireExp = ctx.requireExp !== false;
+  const maxLifetimeSec = ctx.maxLifetimeSec ?? 300;
+  const iatSkewSec = ctx.iatSkewSec ?? 60;
+
+  if (!headerVal || typeof headerVal !== 'string') {
     return fail('no_envelope');
   }
   let env;
@@ -87,29 +100,73 @@ export async function verifyAae(headerVal, ctx) {
   } catch {
     return fail('parse_error');
   }
+  if (env === null || typeof env !== 'object' || Array.isArray(env)) {
+    return fail('parse_error');
+  }
   if (env.v !== 1) return fail('unsupported_version');
-  if (env.aud && env.aud !== expectedAud) {
-    return fail('wrong_audience', { issuer: env.iss, jti: env.jti });
+
+  // Type-validate critical fields BEFORE using them. A buggy/malicious
+  // issuer that sends "1700000000" (string) for exp would otherwise
+  // silently pass via JS type coercion in comparisons.
+  if (env.iss != null && typeof env.iss !== 'string') return fail('iss_invalid_type');
+  if (env.sub != null && typeof env.sub !== 'string') return fail('sub_invalid_type');
+  if (env.jti != null && typeof env.jti !== 'string') return fail('jti_invalid_type');
+  if (env.aud != null && typeof env.aud !== 'string') return fail('aud_invalid_type', { issuer: env.iss });
+  if (env.exp != null && typeof env.exp !== 'number') return fail('exp_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.iat != null && typeof env.iat !== 'number') return fail('iat_invalid_type', { issuer: env.iss, jti: env.jti });
+  if (env.hop != null && typeof env.hop !== 'number') return fail('hop_invalid_type', { issuer: env.iss, jti: env.jti });
+
+  // Audience: when expectedAud is set, env.aud MUST be present AND match.
+  // Skipping the check when env.aud is missing would let an audless envelope
+  // pass for any audience — exactly the kind of cross-namespace replay
+  // we want to prevent.
+  if (expectedAud !== null) {
+    if (typeof env.aud !== 'string' || env.aud !== expectedAud) {
+      return fail('wrong_audience', { issuer: env.iss, jti: env.jti });
+    }
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (env.exp && env.exp < now) {
-    return fail('expired', { issuer: env.iss, jti: env.jti, expiresAt: new Date(env.exp * 1000).toISOString() });
+
+  // Expiry: required by default. A compromised signing key today should
+  // not invalidate a year of past envelopes, so we want short-lived
+  // envelopes only.
+  if (env.exp == null) {
+    if (requireExp) return fail('missing_exp', { issuer: env.iss, jti: env.jti });
+  } else {
+    if (env.exp < now) {
+      return fail('expired', {
+        issuer: env.iss, jti: env.jti,
+        expiresAt: new Date(env.exp * 1000).toISOString(),
+      });
+    }
+    // Cap maximum lifetime — refuse envelopes that try to claim a
+    // year-long validity window. Defends against compromised-key replay.
+    if (env.exp > now + maxLifetimeSec) {
+      return fail('exp_too_far', {
+        issuer: env.iss, jti: env.jti,
+        expiresAt: new Date(env.exp * 1000).toISOString(),
+      });
+    }
   }
-  if (env.iat && env.iat > now + 60) {
+
+  if (env.iat != null && env.iat > now + iatSkewSec) {
     return fail('iat_in_future', { issuer: env.iss, jti: env.jti });
   }
 
   // Replay protection — short window so a captured envelope can be
-  // presented exactly once before the cache + the natural expiry both
-  // reject it.
-  if (env.jti) {
-    const firstTime = ctx.nonceCache.seen(env.jti, env.exp ?? (now + 60));
-    if (!firstTime) {
-      return fail('replay', { issuer: env.iss, jti: env.jti });
-    }
-  } else {
-    return fail('missing_jti');
+  // presented exactly once. NonceCache returns 'cache_full' if it
+  // can't safely accept new entries; we treat that as fail-closed
+  // (rather than evicting an old entry that might still be in flight).
+  if (typeof env.jti !== 'string' || env.jti.length === 0) {
+    return fail('missing_jti', { issuer: env.iss });
+  }
+  const seenResult = ctx.nonceCache.seen(env.jti, env.exp ?? (now + 60));
+  if (seenResult === 'cache_full') {
+    return fail('nonce_cache_full', { issuer: env.iss, jti: env.jti });
+  }
+  if (seenResult !== true) {
+    return fail('replay', { issuer: env.iss, jti: env.jti });
   }
 
   if (await ctx.revocationChecker.isRevoked(env.jti)) {

@@ -13,6 +13,12 @@ const DEFAULT_TTL_NEG_MS = 30 * 1000;
 /**
  * Generic TTL cache around a resolver callback. Subclasses below adapt
  * this to specific use cases (KeyResolver, TrustResolver, ...).
+ *
+ * In-flight promise dedup: if N concurrent requests arrive for the
+ * same uncached key, only ONE call reaches the underlying resolve()
+ * callback. The other N-1 await the same promise. This protects the
+ * caller's storage backend (e.g. CP DB) from thundering-herd loads
+ * triggered by a flood of inbound A2A requests for the same DID/key.
  */
 class TtlResolver {
   /**
@@ -27,15 +33,32 @@ class TtlResolver {
     this._ttlPos = ttlPositiveMs;
     this._ttlNeg = ttlNegativeMs;
     this._cache = new Map();
+    this._inflight = new Map(); // key -> Promise<value>
   }
 
   async _get(key) {
     const cached = this._cache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
-    const value = await this._resolve(key);
-    const ttl = value === null || value === undefined ? this._ttlNeg : this._ttlPos;
-    this._cache.set(key, { value, expiresAt: Date.now() + ttl });
-    return value;
+
+    // Dedup concurrent misses for the same key.
+    const inflight = this._inflight.get(key);
+    if (inflight) return inflight;
+
+    const promise = (async () => {
+      try {
+        const value = await this._resolve(key);
+        const ttl = value === null || value === undefined ? this._ttlNeg : this._ttlPos;
+        this._cache.set(key, { value, expiresAt: Date.now() + ttl });
+        return value;
+      } finally {
+        // Always remove the in-flight entry — whether resolve succeeded,
+        // returned null, or threw. On throw we deliberately do NOT cache
+        // the failure so transient errors can self-heal on retry.
+        this._inflight.delete(key);
+      }
+    })();
+    this._inflight.set(key, promise);
+    return promise;
   }
 
   invalidate(key) {
