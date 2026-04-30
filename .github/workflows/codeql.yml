@@ -1,0 +1,65 @@
+# CodeQL security scanning, replacing GitHub's default-setup so we
+# can scope analysis with paths-ignore.
+#
+# Why custom config: the default-setup scanned test/** and flagged
+# `js/missing-rate-limiting` on the throwaway Express servers our
+# regression tests spin up (where the whole point is to verify the
+# library's behaviour, not to be production-ready endpoints). Test
+# files are excluded here so future regression tests don't refire
+# the same false positives.
+#
+# Default-setup must be disabled for this workflow to be the source
+# of truth — otherwise both runs analyse the repo and you get
+# duplicate alerts.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly off-hours run so newly-discovered queries can find
+    # issues even when the repo isn't actively committed to.
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ['javascript-typescript']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Exclude test + example code: these intentionally use
+          # patterns CodeQL flags on production code (e.g. throwaway
+          # Express handlers without rate-limit) to verify the
+          # library's behaviour. Library source lives in src/ only.
+          config: |
+            paths-ignore:
+              - 'test/**'
+              - 'examples/**'
+              - 'node_modules/**'
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
