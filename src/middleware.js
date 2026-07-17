@@ -213,7 +213,7 @@ export function aclCheckMiddleware({ matchAcl, getSlug = defaultGetSlug, getCapa
  * MUST run after aclCheckMiddleware so the rule's override is on
  * req.firewall.aclRule.
  */
-export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7, logger = null }) {
+export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7, logger = null, skipTrustForCallers = null }) {
   if (!trustResolver) throw new Error('trustScoreGateMiddleware requires trustResolver');
   // Defence against silent misconfiguration. NaN passes typeof===
   // 'number' but means `score < threshold` is always false → every
@@ -222,6 +222,13 @@ export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7
   if (!Number.isFinite(defaultThreshold) || defaultThreshold < 0 || defaultThreshold > 1) {
     throw new Error('defaultThreshold must be a finite number between 0 and 1');
   }
+  // Normalise the skip-list to a Set for O(1) lookup. Accepts Set,
+  // Array, or null. null/empty = no bypass (legacy behaviour).
+  const bypassSet = skipTrustForCallers instanceof Set
+    ? skipTrustForCallers
+    : Array.isArray(skipTrustForCallers)
+      ? new Set(skipTrustForCallers)
+      : null;
 
   return async function trustScoreGate(req, res, next) {
     const fw = ensureFirewall(req);
@@ -232,9 +239,28 @@ export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7
       return res.status(401).json({ error: 'no_caller_identity' });
     }
 
+    // Per-peer bypass: callers with explicitly-trusted DIDs skip the
+    // trust-score gate. The rest of the chain (ACL, sanitise, rate
+    // limit, audit) still runs. Use case: closed/internal networks
+    // where MolTrust's Sybil protection gives same-owner pairs a score
+    // of 0 — those peers can't legitimately pass the gate otherwise.
+    if (bypassSet && bypassSet.has(did)) {
+      logger?.info?.({ did, bypassSet: bypassSet.size }, 'trust gate bypassed (caller in skipTrustForCallers)');
+      fw.trustScore = null; // explicitly null, not undefined — distinguishes from "not yet checked"
+      fw.trustScoreSource = 'bypass';
+      return next();
+    }
+
     let score;
+    let trustSource = 'unknown';
     try {
-      score = await trustResolver.getScore(did);
+      if (typeof trustResolver.getScoreWithSource === 'function') {
+        const result = await trustResolver.getScoreWithSource(did);
+        score = result.score;
+        trustSource = result.source;
+      } else {
+        score = await trustResolver.getScore(did);
+      }
     } catch (err) {
       logger?.error?.({ err: err.message, did }, 'trust score resolver failed');
       return res.status(503).json({ error: 'trust_resolver_unavailable' });
@@ -261,7 +287,7 @@ export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7
     }
 
     if (score < threshold) {
-      logger?.warn?.({ did, score, threshold, source }, 'trust gate denied');
+      logger?.warn?.({ did, score, threshold, source, trustSource }, 'trust gate denied');
       // Don't include score / threshold in the response body —
       // returning them is a precise oracle for an attacker probing
       // how close they are to passing or what the trust formula
@@ -269,6 +295,7 @@ export function trustScoreGateMiddleware({ trustResolver, defaultThreshold = 0.7
       return res.status(403).json({ error: 'trust_score_below_threshold' });
     }
     fw.trustScore = score;
+    fw.trustScoreSource = trustSource;
     next();
   };
 }
@@ -393,6 +420,7 @@ export function rateLimitMiddleware({ rateLimiter, tokenBudget, getSlug = defaul
  */
 export function auditMiddleware({ sink = null, logger = null, includeQueryInAudit = false } = {}) {
   return async function audit(req, res, next) {
+    const reqStart = Date.now();
     res.on('finish', () => {
       const fw = req.firewall ?? {};
       const fullUrl = req.originalUrl ?? req.url ?? '';
@@ -409,8 +437,10 @@ export function auditMiddleware({ sink = null, logger = null, includeQueryInAudi
         status: res.statusCode,
         rule_id: fw.aclRule?.rule_id,
         trust_score: fw.trustScore,
+        trust_score_source: fw.trustScoreSource ?? 'not_checked',
         sanitise_hits: fw.sanitiseHits,
         token_used: fw.tokenUsed,
+        duration_ms: Date.now() - reqStart,
       };
       // The sink may be async (writing to a DB, posting to a queue).
       // A synchronous try/catch does NOT catch a rejected Promise,
@@ -457,13 +487,23 @@ export function auditMiddleware({ sink = null, logger = null, includeQueryInAudi
  * Returns an array of middleware functions ready for app.use().
  */
 export function firewallChain(config) {
+  // skipTrust: when true, omit the trustScoreGate from the chain
+  // entirely. Use case: tenants who want to disable MolTrust for all
+  // inbound A2A (e.g. closed internal network).
+  if (config.skipTrust) {
+    if (config.logger?.warn) config.logger.warn({ skipTrust: true }, 'a2a-acl: trust gate skipped (skipTrust=true)');
+  }
   const chain = [
     verifyAaeMiddleware(config),
     aclCheckMiddleware(config),
-    trustScoreGateMiddleware(config),
+  ];
+  if (!config.skipTrust) {
+    chain.push(trustScoreGateMiddleware(config));
+  }
+  chain.push(
     sanitiseMiddleware(config),
     depthGuardMiddleware(config),
-  ];
+  );
   if (config.circuitBreaker) chain.push(circuitOpenCheckMiddleware(config));
   chain.push(rateLimitMiddleware(config));
   chain.push(auditMiddleware(config));

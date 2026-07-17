@@ -143,10 +143,13 @@ export class KeyResolver {
 }
 
 /**
- * Resolves DID → trust score (number).
+ * Resolves DID → trust score (number) + source metadata.
  * Caller's `resolve(did)` should return:
- *   { score: 0.85 }  (or just a number)
+ *   { score: 0.85, source: 'moltrust_api' }  (or just a number)
  * or null/undefined for unknown DIDs (treated as score 0).
+ *
+ * getScore() returns the numeric score (backward compatible).
+ * getScoreWithSource() returns { score, source } for audit trail use.
  */
 export class TrustResolver {
   constructor(opts) {
@@ -162,6 +165,24 @@ export class TrustResolver {
     if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
     if (typeof v?.score === 'number') return Number.isFinite(v.score) ? v.score : 0;
     return 0;
+  }
+  /**
+   * Returns { score, source } where source indicates the provenance
+   * of the trust score: 'moltrust_api', 'cache_stale', 'unscored',
+   * 'gateway_default', etc. Use this in audit logging to record
+   * whether a decision was made on fresh or stale trust data (Art. 12).
+   */
+  async getScoreWithSource(did) {
+    const v = await this._inner._get(did);
+    if (v === null || v === undefined) return { score: 0, source: 'unscored' };
+    if (typeof v === 'number') return { score: Number.isFinite(v) ? v : 0, source: 'unknown' };
+    if (typeof v?.score === 'number') {
+      return {
+        score: Number.isFinite(v.score) ? v.score : 0,
+        source: v.source ?? 'unknown',
+      };
+    }
+    return { score: 0, source: 'unscored' };
   }
   invalidate(did) {
     this._inner.invalidate(did);
